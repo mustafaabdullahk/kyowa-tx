@@ -149,24 +149,24 @@ fn createDefaultMeasuringConditions() MeasuringConditionFormat {
     // Set general information
     _ = std.fmt.bufPrint(&conditions.general_info.device_id, "PCD-400A", .{}) catch unreachable;
     conditions.general_info.parameter_format_version = 1;
+    conditions.general_info.model = "PCD-400A".*;
 
     // Set default measuring condition
-    conditions.measuring_condition.sampling_frequency = 1000; // 1kHz
-    conditions.measuring_condition.number_of_channels = 1; // 1 channel
+    // conditions.measuring_condition.sampling_frequency = 1000; // 1kHz
+    // conditions.measuring_condition.number_of_channels = 1; // 1 channel
 
     conditions.measuring_condition.sampling_frequency = 5000; // 5.kHz
     conditions.measuring_condition.number_of_channels = 4; // 4 channel
 
     // Set default channel conditions
-    for (conditions.channel_conditions) |channel| {
-        const channelPtr = &channel; // Get a pointer to the channel
-        channelPtr.measurement_on_off = 1; // Measure
-        channelPtr.mode = 0; // Fixed for PCD-400 A/B Strain
-        channelPtr.range_no = 4; // 4 5000 µm/m 20V
-        channelPtr.strain_mode_no = 0; // 0 1G2W
-        channelPtr.lpf_no = 0; // 0 FLAT FLAT
-        channelPtr.hpf_no = 0; // 0 OFF
-        channelPtr.bal_on_off = 0; // OFF
+    for (&conditions.channel_conditions) |*channel| {
+        channel.measurement_on_off = 1; // Measure
+        channel.mode = 0; // Fixed for PCD-400 A/B Strain
+        channel.range_no = 4; // 4 5000 µm/m 20V
+        channel.strain_mode_no = 0; // 0 1G2W
+        channel.lpf_no = 0; // 0 FLAT FLAT
+        channel.hpf_no = 0; // 0 OFF
+        channel.bal_on_off = 0; // OFF
     }
 
     return conditions;
@@ -210,8 +210,11 @@ pub fn setMeasuringConditions(conditions: MeasuringConditionFormat) !void {
 
     // Check response
     if (response.header.pcd_error_status != 0) {
+        std.debug.print("set measuring condition error {}", .{response.header.pcd_error_status});
         return error.PcdError;
     }
+
+    std.debug.print("resultttttttttttttttttt {}", .{response.condition_check_result});
 
     try checkConditionResult(response.condition_check_result);
 }
@@ -313,6 +316,69 @@ fn printBuffer(label: []const u8, buffer: []const u8) void {
     std.debug.print("\n", .{});
 }
 
+fn printSysInformations() !u8 {
+
+    // Prepare SYS command
+    var sys_cmd = SysCommand{
+        .header = CommandHeader{},
+        .command = "SYS".*,
+    };
+
+    // Initialize header
+    @memset(&sys_cmd.header.model, 0);
+    @memset(&sys_cmd.header.reserved, 0);
+    _ = try std.fmt.bufPrint(&sys_cmd.header.model, "PCD-400A", .{});
+    sys_cmd.header.transfer_bytes = 3; // Command length (SYS)
+
+    // printBuffer("sys command", std.mem.asBytes(&sys_cmd));
+
+    // Send command
+    try pcd.usbSendCmd(std.mem.asBytes(&sys_cmd));
+
+    // Receive complete response (header + data) in one operation
+    var response: SysResponse = undefined;
+    const retSysResponseSize: i32 = try pcd.usbReceiveCmd(std.mem.asBytes(&response));
+
+    std.debug.print("receive sys command response size {any}\n", .{retSysResponseSize});
+
+    // Check for errors in header
+    if (response.header.pcd_error_status != 0) {
+        std.debug.print("Error: PCD reported error status: 0x{X:0>8}\n", .{response.header.pcd_error_status});
+        return error.PcdError;
+    }
+
+    // Verify response size matches expected
+    if (retSysResponseSize != @sizeOf(SysResponse)) {
+        std.debug.print("Unexpected response size: {} (expected {})\n", .{ retSysResponseSize, @sizeOf(SysResponse) });
+        return error.UnexpectedResponseSize;
+    }
+
+    // printBuffer("sys command receive", std.mem.asBytes(&response));
+    for (response.data) |data| {
+        std.debug.print("Model: {s}\n", .{std.mem.sliceTo(&data.model, 0)});
+        std.debug.print("Firmware version: {s}\n", .{std.mem.sliceTo(&data.firmware_version, 0)});
+        std.debug.print("FPGA version: {s}\n", .{std.mem.sliceTo(&data.fpga_version, 0)});
+        std.debug.print("USB Driver version: {s}\n", .{std.mem.sliceTo(&data.usb_driver_version, 0)});
+        std.debug.print("Serial no: {s}\n", .{std.mem.sliceTo(&data.serial_no, 0)});
+        std.debug.print("Reserved 1: {s}\n", .{std.mem.sliceTo(&data.reserved1, 0)});
+        // std.debug.print("Model: {s}\n", .{std.mem.sliceTo(&data.model_byte, 0)});
+        std.debug.print("Reserved 2: {s}\n", .{std.mem.sliceTo(&data.reserved2, 0)});
+    }
+
+    // Print header information
+    std.debug.print("\nResponse Header Information:\n", .{});
+    std.debug.print("Device Model: {s}\n", .{std.mem.sliceTo(&response.header.model, 0)});
+    std.debug.print("Response Data Size: {} bytes\n", .{response.header.response_data_bytes});
+    std.debug.print("PCD Status: 0x{X:0>8}\n", .{response.header.pcd_status});
+    std.debug.print("Error Status: 0x{X:0>8}\n", .{response.header.pcd_error_status});
+    std.debug.print("Sampling Frequency: {} Hz\n", .{response.header.sampling_frequency});
+    std.debug.print("Measuring channel bit: {} Hz\n", .{response.header.measuring_channel_bit});
+    std.debug.print("Number of Channels: {}\n", .{response.header.number_of_channels});
+    std.debug.print("Number of Stacking PCDs: {}\n", .{response.header.number_of_stacking_pcd});
+
+    return 0;
+}
+
 pub fn main() !void {
     std.debug.print("Opening USB connection...\n", .{});
 
@@ -365,16 +431,23 @@ pub fn main() !void {
     std.debug.print("\nCurrent sampling frequency: {} Hz\n", .{current_conditions.measuring_condition.sampling_frequency});
     std.debug.print("Current number of channels: {}\n", .{current_conditions.measuring_condition.number_of_channels});
 
-    // // Create and set new conditions
-    // std.debug.print("\nSetting new measuring conditions...\n", .{});
-    // var new_conditions = createDefaultMeasuringConditions();
-    // new_conditions.measuring_condition.sampling_frequency = 2000; // 2kHz
-    // new_conditions.measuring_condition.number_of_channels = 2; // 2 channels
-    // new_conditions.channel_conditions[0].measurement_on_off = 1; // Enable channel 1
-    // new_conditions.channel_conditions[1].measurement_on_off = 1; // Enable channel 2
+    // Create and set new conditions
+    std.debug.print("\nSetting new measuring conditions...\n", .{});
+    var new_conditions = createDefaultMeasuringConditions();
+    new_conditions.measuring_condition.sampling_frequency = 2000; // 2kHz
+    new_conditions.measuring_condition.number_of_channels = 2; // 2 channels
+    for (&new_conditions.channel_conditions) |*channel| {
+        channel.measurement_on_off = 1;
+        channel.mode = 0;
+        channel.range_no = 4;
+        channel.strain_mode_no = 0;
+        channel.lpf_no = 0;
+        channel.hpf_no = 0;
+        channel.bal_on_off = 1;
+    }
 
-    // try setMeasuringConditions(new_conditions);
-    // std.debug.print("New measuring conditions set successfully!\n", .{});
+    try setMeasuringConditions(new_conditions);
+    std.debug.print("New measuring conditions set successfully!\n", .{});
 
     // Start AD conversion
     std.debug.print("Starting AD conversion...\n", .{});
@@ -388,74 +461,6 @@ pub fn main() !void {
     const stop_status = try stopAdConversion();
     std.debug.print("AD Conversion stopped with status: {}\n", .{stop_status});
 
-    // Prepare SYS command
-    var sys_cmd = SysCommand{
-        .header = CommandHeader{},
-        .command = "SYS".*,
-    };
-
-    // Initialize header
-    @memset(&sys_cmd.header.model, 0);
-    @memset(&sys_cmd.header.reserved, 0);
-    _ = try std.fmt.bufPrint(&sys_cmd.header.model, "PCD-400A", .{});
-    sys_cmd.header.transfer_bytes = 3; // Command length (SYS)
-
-    printBuffer("sys command", std.mem.asBytes(&sys_cmd));
-
-    // Send command
-    try pcd.usbSendCmd(std.mem.asBytes(&sys_cmd));
-
-    // Receive complete response (header + data) in one operation
-    var response: SysResponse = undefined;
-    const retSysResponseSize = pcd.usbReceiveCmd(std.mem.asBytes(&response));
-
-    std.debug.print("receive sys command response size {any}", .{retSysResponseSize});
-
-    printBuffer("sys command receive", std.mem.asBytes(&response));
-
-    // var modelVar: [32]u8 = undefined;
-    // const retModelSize = pcd.usbReceiveCmd(std.mem.asBytes(&modelVar));
-
-    // std.debug.print("receive model response size {any}", .{retModelSize});
-
-    // printBuffer("sys command receive", std.mem.asBytes(&modelVar));
-
-    for (response.data) |data| {
-        // _ = pcd;
-        std.debug.print("Model: {s}\n", .{std.mem.sliceTo(&data.model, 0)});
-        std.debug.print("Firmware version: {s}\n", .{std.mem.sliceTo(&data.firmware_version, 0)});
-    }
-
-    // Print header information
-    std.debug.print("\nResponse Header Information:\n", .{});
-    std.debug.print("Device Model: {s}\n", .{std.mem.sliceTo(&response.header.model, 0)});
-    std.debug.print("Response Data Size: {} bytes\n", .{response.header.response_data_bytes});
-    std.debug.print("PCD Status: 0x{X:0>8}\n", .{response.header.pcd_status});
-    std.debug.print("Error Status: 0x{X:0>8}\n", .{response.header.pcd_error_status});
-    std.debug.print("Sampling Frequency: {} Hz\n", .{response.header.sampling_frequency});
-    std.debug.print("Measuring channel bit: {} Hz\n", .{response.header.measuring_channel_bit});
-    // printActiveChannels(response.header.measuring_channel_bit);
-    std.debug.print("Number of Channels: {}\n", .{response.header.number_of_channels});
-    std.debug.print("Number of Stacking PCDs: {}\n", .{response.header.number_of_stacking_pcd});
-
-    // Check for errors in header
-    // if (response.header.pcd_error_status != 0) {
-    //     std.debug.print("Error: PCD reported error status: 0x{X:0>8}\n", .{response.header.pcd_error_status});
-    //     return error.PcdError;
-    // }
-
-    // // Verify response size matches expected
-    // if (response.header.response_data_bytes != @sizeOf(SysResponseData)) {
-    //     std.debug.print("Unexpected response size: {} (expected {})\n", .{ response.header.response_data_bytes, @sizeOf(SysResponseData) });
-    //     return error.UnexpectedResponseSize;
-    // }
-
-    // Print system information
-    // std.debug.print("\nSystem Information:\n", .{});
-    // std.debug.print("Model: {s}\n", .{std.mem.sliceTo(&response.data.model, 0)});
-    // std.debug.print("Firmware Version: {s}\n", .{std.mem.sliceTo(&response.data.firmware_version, 0)});
-    // std.debug.print("FPGA Version: {s}\n", .{std.mem.sliceTo(&response.data.fpga_version, 0)});
-    // std.debug.print("USB Driver Version: {s}\n", .{std.mem.sliceTo(&response.data.usb_driver_version, 0)});
-    // std.debug.print("Serial Number: {s}\n", .{std.mem.sliceTo(&response.data.serial_no, 0)});
-    // std.debug.print("Model Byte: 0x{X:0>2}\n", .{response.data.model_byte});
+    const sysinfo_status = try printSysInformations();
+    std.debug.print("AD Conversion started with status: {}\n", .{sysinfo_status});
 }
