@@ -1,6 +1,9 @@
 const std = @import("std");
 const pcd = @import("pcd400.zig");
 
+// Constants
+pub const MAX_CHANNELS: usize = 4;
+
 // Command packet structures
 const CommandHeader = extern struct {
     model: [20]u8 = undefined, // "PCD-400A"
@@ -27,7 +30,7 @@ const SysCommand = extern struct {
 const MeasuringCondition = extern struct {
     sampling_frequency: u32, // 1 to 10000
     number_of_channels: u16, // 0 to 16
-    reserved: [26]u8,
+    reserved: [26]u8, // Reserved
 };
 
 const ChannelCondition = extern struct {
@@ -38,16 +41,16 @@ const ChannelCondition = extern struct {
     lpf_no: u8,
     hpf_no: u8,
     bal_on_off: u8, // 0: OFF, 1: ON
-    reserved: [25]u8,
+    reserved: [25]u8, // Reserved
 };
 
 // Measuring condition format structures
 const GeneralInformation = extern struct {
     device_id: [20]u8, // "PCD-400A" fixed
     parameter_format_version: u16, // 1 fixed
-    reserved1: [2]u8,
-    model: [8]u8, // Model 1 to 4
-    reserved2: [48]u8,
+    reserved1: [2]u8, // Reserved
+    model: [8]u8, // Model 2 for PCD-400A/B
+    reserved2: [48]u8, // Reserved
 };
 
 const MeasuringConditionFormat = extern struct {
@@ -65,9 +68,9 @@ const MesSetCommand = extern struct {
 };
 
 const MesLoadCommand = extern struct {
-    header: CommandHeader,
-    command: [3]u8, // "MES"
-    parameter_mode: u8, // 0x00 for Load
+    header: CommandHeader align(1),
+    command: [3]u8 align(1), // "MES"
+    parameter_mode: u8 align(1), // 0x00 for Load
 };
 
 const MesSetResponse = extern struct {
@@ -129,6 +132,57 @@ const AdConversionResponse = extern struct {
     status: u8, // Status of the conversion (1 byte)
 };
 
+fn printHexView(label: []const u8, buffer: []const u8) void {
+    std.debug.print("{s}:\n", .{label});
+    for (buffer, 0..) |byte, i| {
+        if (i % 16 == 0) {
+            if (i > 0) std.debug.print("\n", .{});
+            std.debug.print("{d:0>4}: ", .{i});
+        }
+        std.debug.print("{x:0>2} ", .{byte});
+    }
+    std.debug.print("\n\n", .{});
+}
+
+fn printHexViewDetailed(label: []const u8, buffer: []const u8, print_ascii: bool) void {
+    std.debug.print("\n{s}:\n", .{label});
+    var i: usize = 0;
+    while (i < buffer.len) {
+        // Print offset
+        std.debug.print("{x:0>4}: ", .{i});
+
+        // Print hex values (16 bytes per line)
+        var j: usize = 0;
+        while (j < 16) : (j += 1) {
+            if (i + j < buffer.len) {
+                std.debug.print("{x:0>2} ", .{buffer[i + j]});
+            } else {
+                std.debug.print("   ", .{}); // Padding for incomplete line
+            }
+        }
+
+        // Print ASCII representation if requested
+        if (print_ascii) {
+            std.debug.print("  ", .{});
+            j = 0;
+            while (j < 16) : (j += 1) {
+                if (i + j < buffer.len) {
+                    const c = buffer[i + j];
+                    if (c >= 32 and c <= 126) {
+                        std.debug.print("{c}", .{c});
+                    } else {
+                        std.debug.print(".", .{});
+                    }
+                }
+            }
+        }
+
+        std.debug.print("\n", .{});
+        i += 16;
+    }
+    std.debug.print("\n", .{});
+}
+
 fn printActiveChannels(channel_bit: u32) void {
     std.debug.print("Active channels: ", .{});
     var i: u5 = 0;
@@ -185,36 +239,109 @@ fn checkConditionResult(result: u32) !void {
     return error.MeasuringConditionError;
 }
 
-pub fn setMeasuringConditions(conditions: MeasuringConditionFormat) !void {
+fn setMeasuringConditions(conditions: MeasuringConditionFormat) !void {
     var cmd = MesSetCommand{
         .header = CommandHeader{},
         .command = "MES".*,
         .parameter_mode = 0x01,
-        .measuring_conditions = conditions,
+        .measuring_conditions = undefined,
     };
+
+    // _ = conditions;
 
     // Initialize header
     @memset(&cmd.header.model, 0);
-    @memset(&cmd.header.reserved, 0);
     _ = try std.fmt.bufPrint(&cmd.header.model, "PCD-400A", .{});
-    cmd.header.transfer_bytes = 1604; // 3 + 1 + 1600 bytes
+    cmd.header.transfer_bytes = 1604; // 3 + 1 + 1600
+    @memset(&cmd.header.reserved, 0);
 
-    // Send command
-    try pcd.usbSendCmd(std.mem.asBytes(&cmd));
+    // Initialize measuring conditions
+    var measuring_conditions: MeasuringConditionFormat = undefined;
+    @memset(@as([*]u8, @ptrCast(&measuring_conditions))[0..@sizeOf(MeasuringConditionFormat)], 0);
 
-    // Receive response
-    var response: MesSetResponse = undefined;
-    const retSetMesResponseSize = pcd.usbReceiveCmd(std.mem.asBytes(&response));
+    // Set general information - this part was missing the device ID
+    @memset(&measuring_conditions.general_info.device_id, 0);
+    _ = try std.fmt.bufPrint(&measuring_conditions.general_info.device_id, "PCD-400A", .{});
+    measuring_conditions.general_info.parameter_format_version = 1;
+    measuring_conditions.general_info.model[0] = 2;
 
-    std.debug.print("set meas command response size {any}", .{retSetMesResponseSize});
+    // Set measuring condition
+    measuring_conditions.measuring_condition.sampling_frequency = 5000;
+    measuring_conditions.measuring_condition.number_of_channels = 4;
 
-    // Check response
-    if (response.header.pcd_error_status != 0) {
-        std.debug.print("set measuring condition error {}", .{response.header.pcd_error_status});
-        return error.PcdError;
+    // Set channel conditions
+    for (&measuring_conditions.channel_conditions, 0..) |*channel, i| {
+        if (i < 4) { // First 4 channels ON
+            channel.* = .{
+                .measurement_on_off = 1, // ON
+                .mode = 0, // Fixed for PCD-400A/B
+                .range_no = 4, // 5000 μm/m
+                .strain_mode_no = 0, // 1G2W
+                .lpf_no = 0, // FLAT
+                .hpf_no = 0, // OFF
+                .bal_on_off = 0, // OFF
+                .reserved = [_]u8{0} ** 25,
+            };
+        } else { // Remaining channels OFF
+            channel.* = .{
+                .measurement_on_off = -1, // No unit
+                .mode = 0,
+                .range_no = 0, // Keep same range for consistency
+                .strain_mode_no = 0,
+                .lpf_no = 0,
+                .hpf_no = 0,
+                .bal_on_off = 0,
+                .reserved = [_]u8{0} ** 25,
+            };
+        }
     }
 
-    std.debug.print("resultttttttttttttttttt {}", .{response.condition_check_result});
+    // Zero the system reserved area
+    @memset(&measuring_conditions.system_reserved, 0);
+
+    // Copy to command structure
+    cmd.measuring_conditions = conditions;
+
+    // Debug print each section to verify
+    const cmd_bytes = std.mem.asBytes(&cmd);
+
+    // Print size info first
+    std.debug.print("\nStructure Sizes:\n", .{});
+    std.debug.print("CommandHeader: {d}\n", .{@sizeOf(CommandHeader)});
+    std.debug.print("GeneralInformation: {d}\n", .{@sizeOf(GeneralInformation)});
+    std.debug.print("MeasuringCondition: {d}\n", .{@sizeOf(MeasuringCondition)});
+    std.debug.print("ChannelCondition: {d}\n", .{@sizeOf(ChannelCondition)});
+    std.debug.print("MeasuringConditionFormat: {d}\n", .{@sizeOf(MeasuringConditionFormat)});
+
+    // Print command sections
+    printHexView("\nFull Command Packet", cmd_bytes);
+    printHexView("\nCommand Header", cmd_bytes[0..64]);
+    printHexView("\nCommand and Mode", cmd_bytes[64..68]);
+    printHexView("\nGeneral Info", cmd_bytes[68..148]);
+    printHexView("\nMeasuring Condition", cmd_bytes[148..180]);
+
+    var label_buf: [32]u8 = undefined;
+    for (0..4) |i| {
+        const start = 180 + (i * 32);
+        const end = start + 32;
+        const label = std.fmt.bufPrint(&label_buf, "\nChannel {d}", .{i + 1}) catch unreachable;
+        printHexView(label, cmd_bytes[start..end]);
+    }
+
+    std.debug.print("\nPacket size: {d} bytes\n", .{cmd_bytes.len});
+
+    // Send command
+    try pcd.usbSendCmd(cmd_bytes);
+
+    // Receive and process response
+    var response: MesSetResponse = undefined;
+    const receive_size: usize = @intCast(try pcd.usbReceiveCmd(std.mem.asBytes(&response)));
+    printHexView("\nResponse Buffer", std.mem.asBytes(&response)[0..receive_size]);
+
+    if (response.header.pcd_error_status != 0) {
+        std.debug.print("PCD Error Status: 0x{X:0>8}\n", .{response.header.pcd_error_status});
+        return error.PcdError;
+    }
 
     try checkConditionResult(response.condition_check_result);
 }
@@ -249,34 +376,250 @@ pub fn loadMeasuringConditions() !MeasuringConditionFormat {
     return response.measuring_conditions;
 }
 
+// Helper function to parse strain mode string to number
+fn parseStrainMode(strain_mode: []const u8) u8 {
+    if (std.mem.eql(u8, strain_mode, "1G2W")) return 0;
+    if (std.mem.eql(u8, strain_mode, "1G3W")) return 1;
+    if (std.mem.eql(u8, strain_mode, "2G")) return 2;
+    if (std.mem.eql(u8, strain_mode, "4G")) return 3;
+    std.debug.print("Unknown strain mode: {s}\n", .{strain_mode});
+    return 0; // Default to 1G2W
+}
+
+// Helper function to parse LPF string to number
+fn parseLpf(lpf: []const u8) u8 {
+    if (std.mem.eql(u8, lpf, "FLAT")) return 0;
+    if (std.mem.eql(u8, lpf, "100Hz")) return 1;
+    if (std.mem.eql(u8, lpf, "30Hz")) return 2;
+    if (std.mem.eql(u8, lpf, "10Hz")) return 3;
+    std.debug.print("Unknown LPF: {s}\n", .{lpf});
+    return 0; // Default to FLAT
+}
+
+// Add helper function to convert numeric values back to strings for debug printing
+fn strainModeToString(mode: u8) []const u8 {
+    return switch (mode) {
+        0 => "1G2W",
+        1 => "1G3W",
+        2 => "2G",
+        3 => "4G",
+        else => "Unknown",
+    };
+}
+
+fn lpfToString(lpf: u8) []const u8 {
+    return switch (lpf) {
+        0 => "FLAT",
+        1 => "100Hz",
+        2 => "30Hz",
+        3 => "10Hz",
+        else => "Unknown",
+    };
+}
+
+fn rangeToString(range: u8) []const u8 {
+    return switch (range) {
+        0 => "200μm/m",
+        1 => "500μm/m",
+        2 => "1000μm/m",
+        3 => "2000μm/m",
+        4 => "5000μm/m",
+        5 => "10000μm/m",
+        6 => "20000μm/m",
+        else => "Unknown",
+    };
+}
+
+pub fn printChannelConfig(config: *const MeasuringConditionFormat) void {
+    std.debug.print("\n=== PCD Configuration Summary ===\n", .{});
+    std.debug.print("Device ID: {s}\n", .{config.general_info.device_id});
+    std.debug.print("Parameter Version: {d}\n", .{config.general_info.parameter_format_version});
+    std.debug.print("Sampling Frequency: {d} Hz\n", .{config.measuring_condition.sampling_frequency});
+    std.debug.print("Number of Active Channels: {d}\n", .{config.measuring_condition.number_of_channels});
+
+    std.debug.print("\n--- Channel Configurations ---\n", .{});
+    // Only print up to MAX_CHANNELS
+    for (config.channel_conditions[0..MAX_CHANNELS], 0..) |channel, i| {
+        std.debug.print("\nChannel {d}:\n", .{i + 1});
+        std.debug.print("  Status: {s}\n", .{if (channel.measurement_on_off == 1) "ON" else if (channel.measurement_on_off == 0) "OFF" else "No Unit"});
+        std.debug.print("  Mode: {d}\n", .{channel.mode});
+        std.debug.print("  Range: {s}\n", .{rangeToString(channel.range_no)});
+        std.debug.print("  Strain Mode: {s}\n", .{strainModeToString(channel.strain_mode_no)});
+        std.debug.print("  LPF: {s}\n", .{lpfToString(channel.lpf_no)});
+        std.debug.print("  HPF: {d}\n", .{channel.hpf_no});
+        std.debug.print("  Balance: {s}\n", .{if (channel.bal_on_off == 1) "ON" else "OFF"});
+    }
+    std.debug.print("\n==============================\n", .{});
+}
+
+fn parseChannelConfig(config_contents: []const u8) !MeasuringConditionFormat {
+    var config: MeasuringConditionFormat = undefined;
+    @memset(@as([*]u8, @ptrCast(&config))[0..@sizeOf(MeasuringConditionFormat)], 0);
+
+    // Set general information
+    _ = std.fmt.bufPrint(&config.general_info.device_id, "PCD-400A", .{}) catch unreachable;
+    config.general_info.parameter_format_version = 1;
+
+    // Set model to 2 for PCD-400A/B
+    config.general_info.model[0] = 2;
+
+    // Set measuring condition defaults
+    config.measuring_condition = .{
+        .sampling_frequency = 5000, // 5kHz
+        .number_of_channels = 0, // Will be updated as we count active channels
+        .reserved = [_]u8{0} ** 26,
+    };
+
+    // Initialize all channels to OFF state
+    for (&config.channel_conditions) |*ch| {
+        ch.* = .{
+            .measurement_on_off = -1, // No unit by default
+            .mode = 0, // Fixed to 0 for PCD-400A/B
+            .range_no = 4, // 5k μm/m
+            .strain_mode_no = 0, // 1G2W
+            .lpf_no = 0, // FLAT
+            .hpf_no = 0, // OFF
+            .bal_on_off = 0, // OFF
+            .reserved = [_]u8{0} ** 25,
+        };
+    }
+
+    var lines = std.mem.split(u8, config_contents, "\n");
+    // Skip header
+    _ = lines.next();
+
+    var active_channels: u16 = 0;
+
+    // Process each line
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \r\n");
+        if (trimmed.len == 0) continue;
+
+        var columns = std.mem.split(u8, trimmed, ",");
+
+        // Parse channel number (first column)
+        const ch_num = std.fmt.parseInt(usize, std.mem.trim(u8, columns.next() orelse continue, " "), 10) catch continue;
+
+        if (ch_num < 1 or ch_num > MAX_CHANNELS) continue;
+
+        // Skip Model column
+        _ = columns.next();
+
+        // Measurement ON/OFF
+        const meas = columns.next() orelse continue;
+        if (std.mem.eql(u8, std.mem.trim(u8, meas, " "), "ON")) {
+            config.channel_conditions[ch_num - 1].measurement_on_off = 1;
+            active_channels += 1;
+        }
+
+        // Skip Mode column (should be Strain)
+        _ = columns.next();
+
+        // Strain Mode
+        if (columns.next()) |strain_mode| {
+            const trimmed_mode = std.mem.trim(u8, strain_mode, " ");
+            config.channel_conditions[ch_num - 1].strain_mode_no = parseStrainMode(trimmed_mode);
+        }
+
+        // Skip Gage Factor
+        _ = columns.next();
+
+        // Range
+        if (columns.next()) |range| {
+            const trimmed_range = std.mem.trim(u8, range, " ");
+            if (std.mem.eql(u8, trimmed_range, "5k")) {
+                config.channel_conditions[ch_num - 1].range_no = 4; // 5000 μm/m
+            }
+        }
+
+        // LPF
+        if (columns.next()) |lpf| {
+            const trimmed_lpf = std.mem.trim(u8, lpf, " ");
+            config.channel_conditions[ch_num - 1].lpf_no = parseLpf(trimmed_lpf);
+        }
+
+        // Balance
+        if (columns.next()) |bal| {
+            const trimmed_bal = std.mem.trim(u8, bal, " ");
+            config.channel_conditions[ch_num - 1].bal_on_off =
+                if (std.mem.eql(u8, trimmed_bal, "ON")) 1 else 0;
+        }
+    }
+
+    // Set number of active channels
+    config.measuring_condition.number_of_channels = active_channels;
+    std.debug.print("Total active channels: {d}\n", .{active_channels});
+
+    return config;
+}
+
+pub fn loadChannelConfig(config_path: []const u8) !MeasuringConditionFormat {
+    // Read entire file contents
+    const config_contents = try std.fs.cwd().readFileAlloc(std.heap.page_allocator, config_path, 1024 // Max file size
+    );
+    defer std.heap.page_allocator.free(config_contents);
+
+    return parseChannelConfig(config_contents);
+}
+
 pub fn startAdConversion() !u8 {
+    // Detailed status check before starting
+    var status_cmd = CommandHeader{};
+    @memset(&status_cmd.model, 0);
+    @memset(&status_cmd.reserved, 0);
+    _ = try std.fmt.bufPrint(&status_cmd.model, "PCD-400A", .{});
+    status_cmd.transfer_bytes = 0;
+
+    try pcd.usbSendCmd(std.mem.asBytes(&status_cmd));
+
+    var status_response: ResponseHeader = undefined;
+    _ = try pcd.usbReceiveCmd(std.mem.asBytes(&status_response));
+
+    std.debug.print("Pre-Start Status: 0x{X:0>8}\n", .{status_response.pcd_status});
+    std.debug.print("Pre-Start Error Status: 0x{X:0>8}\n", .{status_response.pcd_error_status});
+
+    // Check if AD conversion start is available (bit 0x00000001)
+    if (status_response.pcd_status & 0x00000001 == 0) {
+        std.debug.print("AD conversion not available. PCD Status: 0x{X:0>8}\n", .{status_response.pcd_status});
+        return error.AdConversionNotAvailable;
+    }
+
+    // Prepare STA command
     var cmd = StartAdConversionCommand{
         .header = CommandHeader{},
         .command = "STA".*,
     };
 
-    // Initialize header
     @memset(&cmd.header.model, 0);
     @memset(&cmd.header.reserved, 0);
     _ = try std.fmt.bufPrint(&cmd.header.model, "PCD-400A", .{});
+    cmd.header.transfer_bytes = 3;
 
     // Send command
     try pcd.usbSendCmd(std.mem.asBytes(&cmd));
 
     // Receive response
     var response: AdConversionResponse = undefined;
-    const retAdConversionCommand = pcd.usbReceiveCmd(std.mem.asBytes(&response));
+    const receive_size = try pcd.usbReceiveCmd(std.mem.asBytes(&response));
 
-    std.debug.print("start ad conversion response size {any}", .{retAdConversionCommand});
+    // Additional detailed logging
+    std.debug.print("Start Conversion Response Size: {}\n", .{receive_size});
+    std.debug.print("Start Conversion Status: 0x{X:0>8}\n", .{response.header.pcd_status});
+    std.debug.print("Start Conversion Error Status: 0x{X:0>8}\n", .{response.header.pcd_error_status});
+
+    // Verify status is now 0x00000003 (AD conversion in progress)
+    if (response.header.pcd_status & 0x00000003 != 0x00000003) {
+        std.debug.print("AD conversion not started correctly\n", .{});
+        return error.AdConversionStartFailed;
+    }
 
     // Check for errors
     if (response.header.pcd_error_status != 0) {
+        std.debug.print("PCD Error Status: 0x{X:0>8}\n", .{response.header.pcd_error_status});
         return error.PcdError;
-    } else {
-        std.debug.print("received start ad command {}", .{response.status});
     }
 
-    return response.status; // Return the status of the conversion
+    return response.status;
 }
 
 pub fn stopAdConversion() !u8 {
@@ -306,6 +649,313 @@ pub fn stopAdConversion() !u8 {
 
     return response.status; // Return the status of the conversion
 }
+
+// Maximum number of samples to store
+const MAX_SAMPLES = 10000;
+
+// Updated AdDataSample struct to include both converted and raw data
+pub const AdDataSample = struct {
+    timestamp: i64,
+    channel_data: [16]f32, // Converted engineering units
+    raw_ad_data: [16]i32, // Original AD values
+};
+
+pub const DataAcquisitionConfig = struct {
+    sample_interval_ns: u64, // Nanoseconds between GMD command calls
+    buffer_size: usize, // Size of circular buffer to store samples
+    max_retries: u8, // Maximum retries on communication error
+};
+
+pub const DataAcquisitionStats = struct {
+    total_samples: usize = 0,
+    buffer_overruns: usize = 0,
+    comm_errors: usize = 0,
+    last_error: ?anyerror = null,
+};
+
+fn convertAdValueToRange(ad_value: i32, range_index: u8) f32 {
+    const ranges = [_]f32{
+        200.0, // 200 μm/m
+        500.0, // 500 μm/m
+        1000.0, // 1000 μm/m
+        2000.0, // 2000 μm/m
+        5000.0, // 5000 μm/m
+        10000.0, // 10000 μm/m
+        20000.0, // 20000 μm/m
+    };
+
+    const selected_range = if (range_index < ranges.len) ranges[range_index] else 5000.0;
+    return (selected_range / 8200000.0) * @as(f32, @floatFromInt(ad_value));
+}
+
+pub const ContinuousDataAcquisition = struct {
+    config: DataAcquisitionConfig,
+    measuring_conditions: MeasuringConditionFormat,
+    stats: DataAcquisitionStats,
+    allocator: std.mem.Allocator,
+    is_running: std.atomic.Value(bool),
+    data_mutex: std.Thread.Mutex,
+    circular_buffer: CircularBuffer,
+    acquisition_thread: ?std.Thread = null,
+
+    const CircularBuffer = struct {
+        buffer: []AdDataSample,
+        head: usize,
+        tail: usize,
+        count: usize,
+
+        pub fn init(allocator: std.mem.Allocator, size: usize) !CircularBuffer {
+            return CircularBuffer{
+                .buffer = try allocator.alloc(AdDataSample, size),
+                .head = 0,
+                .tail = 0,
+                .count = 0,
+            };
+        }
+
+        pub fn deinit(self: *CircularBuffer, allocator: std.mem.Allocator) void {
+            allocator.free(self.buffer);
+        }
+
+        pub fn push(self: *CircularBuffer, sample: AdDataSample) bool {
+            if (self.count == self.buffer.len) {
+                return false; // Buffer full
+            }
+            self.buffer[self.tail] = sample;
+            self.tail = (self.tail + 1) % self.buffer.len;
+            self.count += 1;
+            return true;
+        }
+
+        pub fn pop(self: *CircularBuffer) ?AdDataSample {
+            if (self.count == 0) return null;
+            const sample = self.buffer[self.head];
+            self.head = (self.head + 1) % self.buffer.len;
+            self.count -= 1;
+            return sample;
+        }
+    };
+
+    pub fn init(allocator: std.mem.Allocator, config: DataAcquisitionConfig, conditions: MeasuringConditionFormat) !*ContinuousDataAcquisition {
+        const self = try allocator.create(ContinuousDataAcquisition);
+        self.* = .{
+            .config = config,
+            .measuring_conditions = conditions,
+            .stats = .{},
+            .allocator = allocator,
+            .is_running = std.atomic.Value(bool).init(false),
+            .data_mutex = .{},
+            .circular_buffer = try CircularBuffer.init(allocator, config.buffer_size),
+        };
+        return self;
+    }
+
+    pub fn deinit(self: *ContinuousDataAcquisition) void {
+        if (self.is_running.load(.monotonic)) {
+            self.stop();
+        }
+        self.circular_buffer.deinit(self.allocator);
+        self.allocator.destroy(self);
+    }
+
+    pub fn start(self: *ContinuousDataAcquisition) !void {
+        if (self.is_running.load(.monotonic)) return error.AlreadyRunning;
+
+        // Check device connection first
+        const connected = try pcd.usbConnectCheck();
+        if (!connected) return error.DeviceNotConnected;
+
+        // Start AD conversion
+        const start_status = try startAdConversion();
+        if (start_status != 0) return error.StartConversionFailed;
+
+        // Verify AD conversion started by checking status
+        var status_cmd = CommandHeader{};
+        @memset(&status_cmd.model, 0);
+        @memset(&status_cmd.reserved, 0);
+        _ = try std.fmt.bufPrint(&status_cmd.model, "PCD-400A", .{});
+        status_cmd.transfer_bytes = 0; // Important! For status check, set to 0
+
+        try pcd.usbSendCmd(std.mem.asBytes(&status_cmd));
+
+        var status_response: ResponseHeader = undefined;
+        _ = try pcd.usbReceiveCmd(std.mem.asBytes(&status_response));
+
+        // Check if AD conversion is running (bit 0x00000002)
+        if (status_response.pcd_status & 0x00000002 == 0) {
+            std.debug.print("AD conversion not running. PCD Status: 0x{X:0>8}\n", .{status_response.pcd_status});
+            return error.AdConversionNotRunning;
+        }
+
+        // Check for any PCD errors
+        if (status_response.pcd_error_status != 0) {
+            std.debug.print("PCD Error Status: 0x{X:0>8}\n", .{status_response.pcd_error_status});
+            return error.PcdError;
+        }
+
+        self.is_running.store(true, .monotonic);
+        self.acquisition_thread = try std.Thread.spawn(.{}, acquisitionLoop, .{self});
+    }
+
+    pub fn stop(self: *ContinuousDataAcquisition) void {
+        self.is_running.store(false, .monotonic);
+        if (self.acquisition_thread) |thread| {
+            thread.join();
+            self.acquisition_thread = null;
+        }
+        _ = stopAdConversion() catch |err| {
+            std.debug.print("Error stopping AD conversion: {}\n", .{err});
+        };
+    }
+
+    fn parseGmdResponse(buffer: []const u8, conditions: *const MeasuringConditionFormat) ![]const i32 {
+        // Constant buffer size from the manual
+        const EXPECTED_BUFFER_SIZE: usize = 1024;
+        const HEADER_SIZE = @sizeOf(ResponseHeader);
+
+        // Validate buffer size
+        if (buffer.len != EXPECTED_BUFFER_SIZE) {
+            std.debug.print("Unexpected buffer size. Expected {}, got {}\n", .{ EXPECTED_BUFFER_SIZE, buffer.len });
+            return error.UnexpectedBufferSize;
+        }
+
+        // Cast the first part of the buffer to ResponseHeader
+        const header_ptr: *const ResponseHeader = @ptrCast(@alignCast(buffer.ptr));
+
+        std.debug.print("\n=== GMD Response Analysis ===\n", .{});
+        std.debug.print("Buffer Size: {d} bytes\n", .{buffer.len});
+        std.debug.print("Received Buffer Size: {}\n", .{header_ptr.response_data_bytes});
+        std.debug.print("PCD Status: 0x{X:0>8}\n", .{header_ptr.pcd_status});
+        std.debug.print("Measuring Channel Bit: 0x{X:0>8}\n", .{header_ptr.measuring_channel_bit});
+        std.debug.print("Number of Channels: {}\n", .{header_ptr.number_of_channels});
+
+        // Calculate active channels from channel bit
+        var active_channel_count: u8 = 0;
+        var active_channel_indices: [16]u8 = undefined;
+        for (0..16) |i| {
+            if (header_ptr.measuring_channel_bit & (@as(u32, 1) << @intCast(i)) != 0) {
+                active_channel_indices[active_channel_count] = @intCast(i);
+                active_channel_count += 1;
+            }
+        }
+
+        std.debug.print("Detected Active Channels: {}\n", .{active_channel_count});
+
+        // Locate AD data section
+        const data_start = HEADER_SIZE;
+        const data_end = data_start + (active_channel_count * @sizeOf(i32));
+
+        // Cast AD data section
+        const ad_data_ptr: [*]const i32 = @ptrCast(@alignCast(buffer[data_start..data_end].ptr));
+        const ad_data = ad_data_ptr[0..active_channel_count];
+
+        // Print raw AD values with context
+        std.debug.print("\nRaw AD Values:\n", .{});
+        for (ad_data, 0..) |value, i| {
+            const channel_index = active_channel_indices[i];
+            const range = conditions.channel_conditions[channel_index].range_no;
+            std.debug.print("Channel {}: Raw Value = {}, Range = {s}\n", .{ channel_index + 1, value, rangeToString(range) });
+        }
+
+        return ad_data;
+    }
+
+    fn acquisitionLoop(self: *ContinuousDataAcquisition) !void {
+        const max_consecutive_errors = 10;
+        var consecutive_errors: u8 = 0;
+
+        // Use fixed 1024-byte buffer as specified in the manual
+        var response_buffer: [1024]u8 = undefined;
+
+        while (self.is_running.load(.monotonic)) {
+            // Prepare GMD command
+            var cmd = GmdCommand{
+                .header = CommandHeader{},
+                .command = "GMD".*,
+            };
+
+            @memset(&cmd.header.model, 0);
+            @memset(&cmd.header.reserved, 0);
+            _ = try std.fmt.bufPrint(&cmd.header.model, "PCD-400A", .{});
+            cmd.header.transfer_bytes = 3;
+
+            // Reset buffer before each use
+            @memset(&response_buffer, 0);
+
+            // Send GMD command
+            try pcd.usbSendCmd(std.mem.asBytes(&cmd));
+
+            // Receive exactly 1024 bytes
+            const receive_size = pcd.usbReceiveCmd(&response_buffer) catch |err| {
+                std.debug.print("GMD receive error: {}\n", .{err});
+                consecutive_errors += 1;
+                if (consecutive_errors >= max_consecutive_errors) {
+                    return error.TooManyConsecutiveErrors;
+                }
+                std.time.sleep(100 * std.time.ns_per_ms);
+                continue;
+            };
+
+            // Verify receive size matches expected
+            if (receive_size != 1024) {
+                std.debug.print("Unexpected receive size: {}\n", .{receive_size});
+                consecutive_errors += 1;
+                continue;
+            }
+
+            // Parse response
+            _ = parseGmdResponse(response_buffer[0..], &self.measuring_conditions) catch |err| {
+                std.debug.print("GMD parsing error: {}\n", .{err});
+                consecutive_errors += 1;
+                if (consecutive_errors >= max_consecutive_errors) {
+                    return error.TooManyConsecutiveErrors;
+                }
+                std.time.sleep(100 * std.time.ns_per_ms);
+                continue;
+            };
+
+            // Reset error counter on successful communication
+            consecutive_errors = 0;
+
+            // Optional: Process ad_data
+            // self.processAdData(ad_data);
+
+            // Controlled delay between GMD commands
+            std.time.sleep(self.config.sample_interval_ns);
+        }
+    }
+
+    pub fn getSamples(self: *ContinuousDataAcquisition, buffer: []AdDataSample) usize {
+        self.data_mutex.lock();
+        defer self.data_mutex.unlock();
+
+        var count: usize = 0;
+        while (count < buffer.len) {
+            if (self.circular_buffer.pop()) |sample| {
+                buffer[count] = sample;
+                count += 1;
+            } else {
+                break;
+            }
+        }
+        return count;
+    }
+
+    pub fn getStats(self: *ContinuousDataAcquisition) DataAcquisitionStats {
+        return self.stats;
+    }
+};
+
+// GMD Command structures (similar to other command structures in your existing code)
+const GmdCommand = extern struct {
+    header: CommandHeader,
+    command: [3]u8, // "GMD"
+};
+
+const GmdResponse = extern struct {
+    header: ResponseHeader,
+    data: [16]i32, // Assuming 16 possible channels
+};
 
 fn printBuffer(label: []const u8, buffer: []const u8) void {
     std.debug.print("{s}: ", .{label});
@@ -379,7 +1029,139 @@ fn printSysInformations() !u8 {
     return 0;
 }
 
+// Balance Adjustment Command Structures
+const BalCommand = extern struct {
+    header: CommandHeader,
+    command: [3]u8, // "BAL"
+    parameter_mode: u8, // 0x01 for Execute
+};
+
+const BalResponse = extern struct {
+    header: ResponseHeader,
+    status: u8, // Standard response
+};
+
+const BalResultResponse = extern struct {
+    header: ResponseHeader,
+    results: [16]i8, // Balance adjustment results for 16 channels
+    reserved: [16]u8,
+};
+
+pub fn executeBalanceAdjustment() !void {
+    std.debug.print("Executing Balance Adjustment for all channels...\n", .{});
+
+    // Prepare Balance Adjustment Command
+    var bal_cmd = BalCommand{
+        .header = CommandHeader{},
+        .command = "BAL".*,
+        .parameter_mode = 0x01, // Execute balance adjustment
+    };
+
+    // Initialize header
+    @memset(&bal_cmd.header.model, 0);
+    @memset(&bal_cmd.header.reserved, 0);
+    _ = try std.fmt.bufPrint(&bal_cmd.header.model, "PCD-400A", .{});
+    bal_cmd.header.transfer_bytes = 4; // Command length
+
+    // Send balance adjustment command
+    try pcd.usbSendCmd(std.mem.asBytes(&bal_cmd));
+
+    // Receive initial response
+    var initial_response: BalResponse = undefined;
+    _ = try pcd.usbReceiveCmd(std.mem.asBytes(&initial_response));
+
+    // Check for errors in initial response
+    if (initial_response.header.pcd_error_status != 0) {
+        std.debug.print("Error during balance adjustment initiation. Error status: 0x{X:0>8}\n", .{initial_response.header.pcd_error_status});
+        return error.BalanceAdjustmentError;
+    }
+
+    // Wait for command execution to complete
+    var wait_attempts: u8 = 0;
+    const max_attempts = 50; // Adjust as needed
+    while (wait_attempts < max_attempts) : (wait_attempts += 1) {
+        // Send a command to check status (you can use any command that returns status)
+        var status_cmd = SysCommand{
+            .header = CommandHeader{},
+            .command = "SYS".*,
+        };
+
+        // Initialize header
+        @memset(&status_cmd.header.model, 0);
+        @memset(&status_cmd.header.reserved, 0);
+        _ = try std.fmt.bufPrint(&status_cmd.header.model, "PCD-400A", .{});
+        status_cmd.header.transfer_bytes = 3; // Command length
+
+        // Send command
+        try pcd.usbSendCmd(std.mem.asBytes(&status_cmd));
+
+        // Receive status response
+        var status_response: SysResponse = undefined;
+        _ = try pcd.usbReceiveCmd(std.mem.asBytes(&status_response));
+
+        // Check if command execution is complete
+        // 0x00010000 is the bit indicating "Executing the command"
+        if (status_response.header.pcd_status & 0x00010000 == 0) {
+            break;
+        }
+
+        // Wait a short time before next status check
+        std.time.sleep(100 * std.time.ns_per_ms); // 100ms delay
+    }
+
+    if (wait_attempts >= max_attempts) {
+        std.debug.print("Timeout waiting for balance adjustment to complete\n", .{});
+        return error.BalanceAdjustmentTimeout;
+    }
+
+    // Now load balance adjustment results
+    var bal_load_cmd = BalCommand{
+        .header = CommandHeader{},
+        .command = "BAL".*,
+        .parameter_mode = 0x00, // Load balance adjustment results
+    };
+
+    // Initialize header for load command
+    @memset(&bal_load_cmd.header.model, 0);
+    @memset(&bal_load_cmd.header.reserved, 0);
+    _ = try std.fmt.bufPrint(&bal_load_cmd.header.model, "PCD-400A", .{});
+    bal_load_cmd.header.transfer_bytes = 4; // Command length
+
+    // Send load results command
+    try pcd.usbSendCmd(std.mem.asBytes(&bal_load_cmd));
+
+    // Receive balance adjustment results
+    var results_response: BalResultResponse = undefined;
+    _ = try pcd.usbReceiveCmd(std.mem.asBytes(&results_response));
+
+    // Check for errors in results
+    if (results_response.header.pcd_error_status != 0) {
+        std.debug.print("Error loading balance adjustment results. Error status: 0x{X:0>8}\n", .{results_response.header.pcd_error_status});
+        return error.BalanceAdjustmentError;
+    }
+
+    // Print balance adjustment results
+    std.debug.print("\n=== Balance Adjustment Results ===\n", .{});
+    for (results_response.results, 0..) |result, i| {
+        const result_str = switch (result) {
+            -1 => "No unit/No function/No target channel",
+            0 => "Passed",
+            1 => "Error",
+            2 => "OFF",
+            3 => "Connection error",
+            else => "Unknown status",
+        };
+        std.debug.print("Channel {}: {s} ({})\n", .{ i + 1, result_str, result });
+    }
+    printHexView("\n=== Balance Adjustment Results as HEX ===\n", std.mem.asBytes(&results_response));
+}
+
 pub fn main() !void {
+    const allocator = std.heap.page_allocator;
+
+    // std.debug.print("Performing USB Target Reset...\n", .{});
+    // try pcd.usbTargetReset(); // Add target reset at the beginning
+
     std.debug.print("Opening USB connection...\n", .{});
 
     try pcd.usbOpen();
@@ -391,6 +1173,16 @@ pub fn main() !void {
     const connected = try pcd.usbConnectCheck();
     std.debug.print("Connected: {}\n", .{connected});
 
+    const sysinfo_status = try printSysInformations();
+    std.debug.print("Printing System Informations: {}\n", .{sysinfo_status});
+
+    const config = try loadChannelConfig("channel_config.csv");
+
+    const sampling_frequency = config.measuring_condition.sampling_frequency;
+    const active_channels = config.measuring_condition.number_of_channels;
+
+    // Print the loaded configuration for verification
+    printChannelConfig(&config);
     // First initialize pcd as master
 
     var ini_cmd = IniCommand{
@@ -423,44 +1215,129 @@ pub fn main() !void {
 
     printBuffer("ini command", std.mem.asBytes(&iniResp));
 
-    // First, load current conditions
-    std.debug.print("\nLoading current measuring conditions...\n", .{});
-    const current_conditions = try loadMeasuringConditions();
+    // First, load current conditions to see current state
+    // Load new conditions from file
 
-    // Print current conditions
-    std.debug.print("\nCurrent sampling frequency: {} Hz\n", .{current_conditions.measuring_condition.sampling_frequency});
-    std.debug.print("Current number of channels: {}\n", .{current_conditions.measuring_condition.number_of_channels});
+    // // Print current conditions
+    // std.debug.print("\nCurrent sampling frequency: {} Hz\n", .{current_conditions.measuring_condition.sampling_frequency});
+    // std.debug.print("Current number of channels: {}\n", .{current_conditions.measuring_condition.number_of_channels});
 
-    // Create and set new conditions
-    std.debug.print("\nSetting new measuring conditions...\n", .{});
-    var new_conditions = createDefaultMeasuringConditions();
-    new_conditions.measuring_condition.sampling_frequency = 2000; // 2kHz
-    new_conditions.measuring_condition.number_of_channels = 2; // 2 channels
-    for (&new_conditions.channel_conditions) |*channel| {
-        channel.measurement_on_off = 1;
-        channel.mode = 0;
-        channel.range_no = 4;
-        channel.strain_mode_no = 0;
-        channel.lpf_no = 0;
-        channel.hpf_no = 0;
-        channel.bal_on_off = 1;
-    }
+    // // Create and set new conditions
+    // std.debug.print("\nSetting new measuring conditions...\n", .{});
+    // var new_conditions = createDefaultMeasuringConditions();
+    // new_conditions.measuring_condition.sampling_frequency = 2000; // 2kHz
+    // new_conditions.measuring_condition.number_of_channels = 2; // 2 channels
+    // for (&new_conditions.channel_conditions) |*channel| {
+    //     channel.measurement_on_off = 1;
+    //     channel.mode = 0;
+    //     channel.range_no = 4;
+    //     channel.strain_mode_no = 0;
+    //     channel.lpf_no = 0;
+    //     channel.hpf_no = 0;
+    //     channel.bal_on_off = 1;
+    // }
 
-    try setMeasuringConditions(new_conditions);
+    // Load and set new conditions from file
+    // std.debug.print("\nLoading and setting new conditions from file...\n", .{});
+    // const new_conditions = try loadChannelConfig("channel_config.csv");
+    // Load the current measuring conditions
+
+    // Set measuring conditions with more robust error handling
+    setMeasuringConditions(config) catch |err| {
+        std.debug.print("Failed to set measuring conditions: {any}\n", .{err});
+        return err;
+    };
+
     std.debug.print("New measuring conditions set successfully!\n", .{});
 
-    // Start AD conversion
-    std.debug.print("Starting AD conversion...\n", .{});
-    const start_status = try startAdConversion();
-    std.debug.print("AD Conversion started with status: {}\n", .{start_status});
+    const current_conditions = try loadMeasuringConditions();
 
-    // Your logic for working with the AD conversion...
+    // Print the loaded conditions
+    printChannelConfig(&current_conditions);
 
-    // Stop AD conversion
-    std.debug.print("Stopping AD conversion...\n", .{});
-    const stop_status = try stopAdConversion();
-    std.debug.print("AD Conversion stopped with status: {}\n", .{stop_status});
+    printHexView("Current Measuring Conditions", std.mem.asBytes(&current_conditions));
 
-    const sysinfo_status = try printSysInformations();
-    std.debug.print("AD Conversion started with status: {}\n", .{sysinfo_status});
+    // Execute balance adjustment before starting data acquisition
+    try executeBalanceAdjustment();
+
+    // Set up data acquisition
+    const acq_config = DataAcquisitionConfig{
+        .sample_interval_ns = @divFloor(std.time.ns_per_s, sampling_frequency),
+        .buffer_size = 10000,
+        .max_retries = 5,
+    };
+
+    // Initialize data acquisition with configuration
+    var acquisition = try ContinuousDataAcquisition.init(allocator, acq_config, config // Pass the loaded configuration
+    );
+    defer acquisition.deinit();
+
+    // Start data acquisition
+    try acquisition.start();
+    std.debug.print("Data acquisition started...\n", .{});
+
+    // Prepare CSV file for recording
+    var csv_file = try std.fs.cwd().createFile("measurement_data.csv", .{});
+    defer csv_file.close();
+
+    // Write CSV header
+    try csv_file.writer().print("Timestamp", .{});
+    for (0..active_channels) |i| {
+        try csv_file.writer().print(",Channel{}", .{i + 1});
+    }
+    try csv_file.writer().print("\n", .{});
+
+    // Set measurement duration
+    const start_time = std.time.timestamp();
+    const measurement_duration_s: i64 = 10; // 60 seconds measurement
+
+    // Sample buffer
+    var sample_buffer: [1000]AdDataSample = undefined;
+
+    // Main data collection loop
+    while (true) {
+        const current_time = std.time.timestamp();
+        if (current_time - start_time >= measurement_duration_s) break;
+
+        // Retrieve samples
+        const samples_read = acquisition.getSamples(&sample_buffer);
+        if (samples_read > 0) {
+            // Process and save samples
+            for (sample_buffer[0..samples_read]) |sample| {
+                // Write timestamp
+                try csv_file.writer().print("{}", .{sample.timestamp});
+
+                // Write channel data with conversion
+                for (0..active_channels) |ch| {
+                    const range_value = convertAdValueToRange(sample.raw_ad_data[ch], config.channel_conditions[ch].range_no);
+                    try csv_file.writer().print(",{d:.3}", .{range_value});
+                }
+                try csv_file.writer().print("\n", .{});
+            }
+        }
+
+        // Periodically print statistics
+        const stats = acquisition.getStats();
+        if (stats.buffer_overruns > 0 or stats.comm_errors > 0) {
+            std.debug.print("Statistics - Samples: {d}, Overruns: {d}, Errors: {d}\n", .{ stats.total_samples, stats.buffer_overruns, stats.comm_errors });
+        }
+
+        // Prevent tight loop
+        std.time.sleep(10 * std.time.ns_per_ms);
+    }
+
+    // Cleanup and final statistics
+    std.debug.print("Stopping data acquisition...\n", .{});
+    acquisition.stop();
+
+    const stats = acquisition.getStats();
+    std.debug.print("\nFinal Statistics:\n", .{});
+    std.debug.print("Total Samples: {d}\n", .{stats.total_samples});
+    std.debug.print("Buffer Overruns: {d}\n", .{stats.buffer_overruns});
+    std.debug.print("Communication Errors: {d}\n", .{stats.comm_errors});
+    if (stats.last_error) |err| {
+        std.debug.print("Last Error: {}\n", .{err});
+    }
+
+    try pcd.usbClose();
 }
