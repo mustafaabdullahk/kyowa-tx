@@ -183,11 +183,12 @@ fn printHexViewDetailed(label: []const u8, buffer: []const u8, print_ascii: bool
     std.debug.print("\n", .{});
 }
 
+// Helper function to print active channels
 fn printActiveChannels(channel_bit: u32) void {
     std.debug.print("Active channels: ", .{});
-    var i: u5 = 0;
-    while (i < 32) : (i += 1) {
-        if (channel_bit & (@as(u32, 1) << i) != 0) {
+    var i: u32 = 0;
+    while (i < 16) : (i += 1) { // Only check up to 16 channels as per documentation
+        if (channel_bit & (@as(u32, 1) << @intCast(i)) != 0) {
             std.debug.print("CH{} ", .{i + 1});
         }
     }
@@ -655,7 +656,7 @@ const MAX_SAMPLES = 10000;
 
 // Updated AdDataSample struct to include both converted and raw data
 pub const AdDataSample = struct {
-    timestamp: i64,
+    timestamp: i128,
     channel_data: [16]f32, // Converted engineering units
     raw_ad_data: [16]i32, // Original AD values
 };
@@ -769,29 +770,60 @@ pub const ContinuousDataAcquisition = struct {
         const start_status = try startAdConversion();
         if (start_status != 0) return error.StartConversionFailed;
 
-        // Verify AD conversion started by checking status
-        var status_cmd = CommandHeader{};
-        @memset(&status_cmd.model, 0);
-        @memset(&status_cmd.reserved, 0);
-        _ = try std.fmt.bufPrint(&status_cmd.model, "PCD-400A", .{});
-        status_cmd.transfer_bytes = 0; // Important! For status check, set to 0
+        // According to 6-3-7, to get status we send only the header with transfer_bytes = 0
+        var status_cmd = CommandHeader{
+            .model = undefined,
+            .transfer_bytes = 0, // No additional data
+            .reserved = undefined,
+        };
 
+        // Initialize header fields
+        @memset(std.mem.asBytes(&status_cmd), 0);
+        _ = try std.fmt.bufPrint(&status_cmd.model, "PCD-400A", .{});
+
+        // Send status command
         try pcd.usbSendCmd(std.mem.asBytes(&status_cmd));
 
+        // Receive response
         var status_response: ResponseHeader = undefined;
         _ = try pcd.usbReceiveCmd(std.mem.asBytes(&status_response));
 
-        // Check if AD conversion is running (bit 0x00000002)
-        if (status_response.pcd_status & 0x00000002 == 0) {
-            std.debug.print("AD conversion not running. PCD Status: 0x{X:0>8}\n", .{status_response.pcd_status});
-            return error.AdConversionNotRunning;
+        // Check AD conversion status bits per manual section 4-3:
+        // 0x00000001 - AD conversion start available
+        // 0x00000002 - During AD conversion (measurements)
+        // Expected combined state is 0x00000003 when running
+        if (status_response.pcd_status & 0x00000003 != 0x00000003) {
+            std.debug.print("Invalid AD conversion state. PCD Status: 0x{X:0>8}\n", .{status_response.pcd_status});
+            if (status_response.pcd_status & 0x00000001 == 0) {
+                std.debug.print("AD conversion start not available\n", .{});
+            }
+            if (status_response.pcd_status & 0x00000002 == 0) {
+                std.debug.print("AD conversion not running\n", .{});
+            }
+            return error.AdConversionInvalidState;
         }
 
-        // Check for any PCD errors
+        // Check for error status bits per section 4-4
         if (status_response.pcd_error_status != 0) {
             std.debug.print("PCD Error Status: 0x{X:0>8}\n", .{status_response.pcd_error_status});
+            // Check specific error bits
+            if (status_response.pcd_error_status & 0x00000001 != 0) std.debug.print("Hardware Error\n", .{});
+            if (status_response.pcd_error_status & 0x00000002 != 0) std.debug.print("EEPROM Error\n", .{});
+            if (status_response.pcd_error_status & 0x00000004 != 0) std.debug.print("External SRAM Error\n", .{});
+            if (status_response.pcd_error_status & 0x00000008 != 0) std.debug.print("FPGA Error\n", .{});
+            if (status_response.pcd_error_status & 0x00000100 != 0) std.debug.print("Number of stacking PCD units Error\n", .{});
+            if (status_response.pcd_error_status & 0x00000200 != 0) std.debug.print("Slave units are OFF\n", .{});
             return error.PcdError;
         }
+
+        // Additional checks from the response header
+        std.debug.print("\nStatus Check Results:\n", .{});
+        std.debug.print("Sampling Frequency: {} Hz\n", .{status_response.sampling_frequency});
+        std.debug.print("Number of Channels: {}\n", .{status_response.number_of_channels});
+        std.debug.print("Number of Stacking PCDs: {}\n", .{status_response.number_of_stacking_pcd});
+
+        // Print active channels based on measuring_channel_bit
+        printActiveChannels(status_response.measuring_channel_bit);
 
         self.is_running.store(true, .monotonic);
         self.acquisition_thread = try std.Thread.spawn(.{}, acquisitionLoop, .{self});
@@ -809,119 +841,106 @@ pub const ContinuousDataAcquisition = struct {
     }
 
     fn parseGmdResponse(buffer: []const u8, conditions: *const MeasuringConditionFormat) ![]const i32 {
-        // Constant buffer size from the manual
-        const EXPECTED_BUFFER_SIZE: usize = 1024;
-        const HEADER_SIZE = @sizeOf(ResponseHeader);
+        _ = conditions;
+        // Add more robust validation
+        if (buffer.len < @sizeOf(ResponseHeader)) {
+            std.debug.print("Buffer too small for header: got {}, need {}\n", .{ buffer.len, @sizeOf(ResponseHeader) });
+            return error.BufferTooSmall;
+        }
 
-        // Validate buffer size
-        if (buffer.len != EXPECTED_BUFFER_SIZE) {
-            std.debug.print("Unexpected buffer size. Expected {}, got {}\n", .{ EXPECTED_BUFFER_SIZE, buffer.len });
+        const header = @as(*const ResponseHeader, @ptrCast(@alignCast(buffer.ptr)));
+
+        // Validate expected data size
+        const expected_data_size = header.number_of_channels * @sizeOf(i32);
+        const expected_total_size = @sizeOf(ResponseHeader) + expected_data_size;
+
+        if (buffer.len != expected_total_size) {
+            std.debug.print("Unexpected buffer size: got {}, expected {}\n", .{ buffer.len, expected_total_size });
             return error.UnexpectedBufferSize;
         }
 
-        // Cast the first part of the buffer to ResponseHeader
-        const header_ptr: *const ResponseHeader = @ptrCast(@alignCast(buffer.ptr));
-
-        std.debug.print("\n=== GMD Response Analysis ===\n", .{});
-        std.debug.print("Buffer Size: {d} bytes\n", .{buffer.len});
-        std.debug.print("Received Buffer Size: {}\n", .{header_ptr.response_data_bytes});
-        std.debug.print("PCD Status: 0x{X:0>8}\n", .{header_ptr.pcd_status});
-        std.debug.print("Measuring Channel Bit: 0x{X:0>8}\n", .{header_ptr.measuring_channel_bit});
-        std.debug.print("Number of Channels: {}\n", .{header_ptr.number_of_channels});
-
-        // Calculate active channels from channel bit
-        var active_channel_count: u8 = 0;
-        var active_channel_indices: [16]u8 = undefined;
-        for (0..16) |i| {
-            if (header_ptr.measuring_channel_bit & (@as(u32, 1) << @intCast(i)) != 0) {
-                active_channel_indices[active_channel_count] = @intCast(i);
-                active_channel_count += 1;
-            }
-        }
-
-        std.debug.print("Detected Active Channels: {}\n", .{active_channel_count});
-
-        // Locate AD data section
-        const data_start = HEADER_SIZE;
-        const data_end = data_start + (active_channel_count * @sizeOf(i32));
-
-        // Cast AD data section
-        const ad_data_ptr: [*]const i32 = @ptrCast(@alignCast(buffer[data_start..data_end].ptr));
-        const ad_data = ad_data_ptr[0..active_channel_count];
-
-        // Print raw AD values with context
-        std.debug.print("\nRaw AD Values:\n", .{});
-        for (ad_data, 0..) |value, i| {
-            const channel_index = active_channel_indices[i];
-            const range = conditions.channel_conditions[channel_index].range_no;
-            std.debug.print("Channel {}: Raw Value = {}, Range = {s}\n", .{ channel_index + 1, value, rangeToString(range) });
-        }
+        // Extract AD data with bounds checking
+        const data_start = @sizeOf(ResponseHeader);
+        const data_slice = buffer[data_start..];
+        const ad_data = @as([*]const i32, @ptrCast(@alignCast(data_slice.ptr)))[0..header.number_of_channels];
 
         return ad_data;
     }
 
     fn acquisitionLoop(self: *ContinuousDataAcquisition) !void {
-        const max_consecutive_errors = 10;
-        var consecutive_errors: u8 = 0;
+        // Status command
+        var status_cmd = CommandHeader{};
+        @memset(std.mem.asBytes(&status_cmd), 0);
+        _ = try std.fmt.bufPrint(&status_cmd.model, "PCD-400A", .{});
+        status_cmd.transfer_bytes = 0;
+        try pcd.usbSendCmd(std.mem.asBytes(&status_cmd));
+        var status_response: ResponseHeader = undefined;
+        _ = try pcd.usbReceiveCmd(std.mem.asBytes(&status_response));
 
-        // Use fixed 1024-byte buffer as specified in the manual
-        var response_buffer: [1024]u8 = undefined;
+        std.debug.print("PCD Status: 0x{X:0>8}\n", .{status_response.pcd_status});
+        std.debug.print("Error Status: 0x{X:0>8}\n", .{status_response.pcd_error_status});
+
+        var cmd = GmdCommand{
+            .header = CommandHeader{},
+            .command = "GMD".*,
+        };
+
+        @memset(std.mem.asBytes(&cmd.header), 0);
+        _ = try std.fmt.bufPrint(&cmd.header.model, "PCD-400A", .{});
+        cmd.header.transfer_bytes = 3;
+
+        // const active_channels = self.measuring_conditions.measuring_condition.number_of_channels;
+        // const response_size = @sizeOf(ResponseHeader) + (active_channels * @sizeOf(i32));
+
+        // // According to memo, we need periodic command calls between 100ms to 1sec
+        // const command_interval_ns = 100 * std.time.ns_per_ms; // 100ms interval
+        // var last_command_time = std.time.nanoTimestamp();
 
         while (self.is_running.load(.monotonic)) {
-            // Prepare GMD command
-            var cmd = GmdCommand{
-                .header = CommandHeader{},
-                .command = "GMD".*,
-            };
+            // std.debug.print("AD Conversion started\n", .{});
 
-            @memset(&cmd.header.model, 0);
-            @memset(&cmd.header.reserved, 0);
+            @memset(std.mem.asBytes(&cmd.header), 0);
             _ = try std.fmt.bufPrint(&cmd.header.model, "PCD-400A", .{});
             cmd.header.transfer_bytes = 3;
 
-            // Reset buffer before each use
-            @memset(&response_buffer, 0);
+            // Buffer for 4 channels
+            //const buffer_size = @sizeOf(ResponseHeader) + (1024 * @sizeOf(i32));
 
-            // Send GMD command
-            try pcd.usbSendCmd(std.mem.asBytes(&cmd));
+            // Run for 10 seconds
+            const end_time = std.time.timestamp() + 10;
+            var count: usize = 0;
 
-            // Receive exactly 1024 bytes
-            const receive_size = pcd.usbReceiveCmd(&response_buffer) catch |err| {
-                std.debug.print("GMD receive error: {}\n", .{err});
-                consecutive_errors += 1;
-                if (consecutive_errors >= max_consecutive_errors) {
-                    return error.TooManyConsecutiveErrors;
-                }
-                std.time.sleep(100 * std.time.ns_per_ms);
-                continue;
-            };
+            while (std.time.timestamp() < end_time) {
+                var response_buffer: [1024 * 1024]u8 = undefined;
+                std.debug.print("\n=== GMD Command #{d} ===\n", .{count});
+                // _ = try pcd.usbSendCmd(std.mem.asBytes(&status_cmd));
+                // _ = try pcd.usbReceiveCmd(std.mem.asBytes(&status_response));
 
-            // Verify receive size matches expected
-            if (receive_size != 1024) {
-                std.debug.print("Unexpected receive size: {}\n", .{receive_size});
-                consecutive_errors += 1;
-                continue;
+                // std.debug.print("PCD Status: 0x{X:0>8}\n", .{status_response.pcd_status});
+                // std.debug.print("Error Status: 0x{X:0>8}\n", .{status_response.pcd_error_status});
+
+                // _ = try pcd.usbSendCmd(std.mem.asBytes(&status_cmd));
+                // _ = try pcd.usbReceiveCmd(std.mem.asBytes(&status_response));
+
+                // std.debug.print("PCD Status: 0x{X:0>8}\n", .{status_response.pcd_status});
+                // std.debug.print("Error Status: 0x{X:0>8}\n", .{status_response.pcd_error_status});
+                // Send GMD command
+                try pcd.usbSendCmd(std.mem.asBytes(&cmd));
+                std.debug.print("GMD command sent\n", .{});
+
+                // Receive response
+                const receive_size = try pcd.usbReceiveCmd(&response_buffer);
+                std.debug.print("Received {d} bytes\n", .{receive_size});
+
+                // Print response as hex for debugging
+                //printHexView("Response", response_buffer[0..@intCast(receive_size)]);
+                // std.time.sleep(100 * std.time.ns_per_ms); // 100ms interval
+                count += 1;
             }
 
-            // Parse response
-            _ = parseGmdResponse(response_buffer[0..], &self.measuring_conditions) catch |err| {
-                std.debug.print("GMD parsing error: {}\n", .{err});
-                consecutive_errors += 1;
-                if (consecutive_errors >= max_consecutive_errors) {
-                    return error.TooManyConsecutiveErrors;
-                }
-                std.time.sleep(100 * std.time.ns_per_ms);
-                continue;
-            };
-
-            // Reset error counter on successful communication
-            consecutive_errors = 0;
-
-            // Optional: Process ad_data
-            // self.processAdData(ad_data);
-
-            // Controlled delay between GMD commands
-            std.time.sleep(self.config.sample_interval_ns);
+            // Stop AD conversion
+            // try stopAdConversion();
+            std.debug.print("AD Conversion stopped\n", .{});
         }
     }
 
@@ -948,8 +967,8 @@ pub const ContinuousDataAcquisition = struct {
 
 // GMD Command structures (similar to other command structures in your existing code)
 const GmdCommand = extern struct {
-    header: CommandHeader,
-    command: [3]u8, // "GMD"
+    header: CommandHeader, // 64 bytes
+    command: [3]u8, // 3 bytes for "GMD"
 };
 
 const GmdResponse = extern struct {
@@ -1178,7 +1197,7 @@ pub fn main() !void {
 
     const config = try loadChannelConfig("channel_config.csv");
 
-    const sampling_frequency = config.measuring_condition.sampling_frequency;
+    // const sampling_frequency = config.measuring_condition.sampling_frequency;
     const active_channels = config.measuring_condition.number_of_channels;
 
     // Print the loaded configuration for verification
@@ -1260,9 +1279,11 @@ pub fn main() !void {
     // Execute balance adjustment before starting data acquisition
     try executeBalanceAdjustment();
 
+    std.time.sleep(1 * std.time.ns_per_s); // Wait for balance adjustment to complete
+
     // Set up data acquisition
     const acq_config = DataAcquisitionConfig{
-        .sample_interval_ns = @divFloor(std.time.ns_per_s, sampling_frequency),
+        .sample_interval_ns = @divFloor(std.time.ns_per_s, 5000),
         .buffer_size = 10000,
         .max_retries = 5,
     };
@@ -1289,7 +1310,7 @@ pub fn main() !void {
 
     // Set measurement duration
     const start_time = std.time.timestamp();
-    const measurement_duration_s: i64 = 10; // 60 seconds measurement
+    const measurement_duration_s: i64 = 60; // 60 seconds measurement
 
     // Sample buffer
     var sample_buffer: [1000]AdDataSample = undefined;
