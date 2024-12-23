@@ -70,12 +70,28 @@ pub fn usbConnectCheck() !bool {
 }
 
 pub fn usbSendCmd(data: []const u8) !void {
+    std.debug.print("\nSent Packet Size:{d}\n", .{data.len});
+    std.debug.print("Sending packet data: ", .{});
+    for (data) |byte| {
+        std.debug.print("{X:0>2} ", .{byte});
+    }
+    std.debug.print("\n", .{});
+
     const result = PCD400_UsbSendCmd(@intCast(data.len), data.ptr);
 
-    std.debug.print("\nSent Packet Size:{d}\n", .{data.len});
-
     if (result != 0) {
-        return error.SendCmdFailed;
+        const error_code = Error.fromI32(result);
+        std.debug.print("UsbSendCmd failed with error code: {}, numeric value: {d}\n", .{ error_code, result });
+
+        return switch (error_code) {
+            .NOT_OPEN => error.DeviceNotOpen,
+            .PARAM => error.InvalidParameter,
+            .LOCKED => error.DeviceLocked,
+            .NO_TARGET => error.NoDeviceTarget,
+            .TRANS => error.CommunicationTransmissionError,
+            .EXCEPTION => error.UnexpectedException,
+            .NONE => error.SendCmdFailed, // Shouldn't happen, but just in case
+        };
     }
 }
 
@@ -85,8 +101,18 @@ pub fn usbReceiveCmd(buffer: []u8) !i32 {
     std.debug.print("\nReceived Packet Size:{d}, buffer len={d}\n", .{ result, buffer.len });
 
     if (result < 0) {
-        std.debug.print("UsbReceiveCmd failed with ={d}", .{result});
-        return error.ReceiveCmdFailed;
+        const error_code = Error.fromI32(result);
+        std.debug.print("UsbReceiveCmd failed with error code: {}, numeric value: {d}\n", .{ error_code, result });
+
+        return switch (error_code) {
+            .NOT_OPEN => error.DeviceNotOpen,
+            .PARAM => error.InvalidParameter,
+            .LOCKED => error.DeviceLocked,
+            .NO_TARGET => error.NoDeviceTarget,
+            .TRANS => error.CommunicationTransmissionError,
+            .EXCEPTION => error.UnexpectedException,
+            .NONE => error.ReceiveCmdFailed, // Shouldn't happen, but just in case
+        };
     }
 
     return result;
