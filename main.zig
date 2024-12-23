@@ -654,11 +654,59 @@ pub fn stopAdConversion() !u8 {
 // Maximum number of samples to store
 const MAX_SAMPLES = 10000;
 
-// Updated AdDataSample struct to include both converted and raw data
-pub const AdDataSample = struct {
+// Conversion constants
+const AD_MAX_VALUE: f32 = 8200000.0; // Maximum AD value for full scale
+const DEFAULT_GAGE_FACTOR: f32 = 2.00; // Default gage factor used by PCD
+
+fn compensateNonlinearity(strain: f32) f32 {
+    // ε1 = ε0 - (ε0 × |ε0| × 10^-6)
+    // where ε0 is measured strain and ε1 is compensated strain
+    const abs_strain = @abs(strain);
+    return strain - (strain * abs_strain * 1e-6);
+}
+
+fn compensateGageFactor(strain: f32, gage_factor: f32) f32 {
+    // ε2 = ε1 × (2.00 / Ks)
+    // where ε1 is nonlinearity compensated strain,
+    // Ks is actual gage factor, and ε2 is true strain
+    return strain * (DEFAULT_GAGE_FACTOR / gage_factor);
+}
+
+fn convertAdValueToRange(ad_value: i32, range_index: u8, strain_mode: u8, gage_factor: f32) f32 {
+    const ranges = [_]f32{
+        200.0, // 200 μm/m
+        500.0, // 500 μm/m
+        1000.0, // 1000 μm/m
+        2000.0, // 2000 μm/m
+        5000.0, // 5000 μm/m
+        10000.0, // 10000 μm/m
+        20000.0, // 20000 μm/m
+    };
+
+    // Select range value, default to 5000 if index is out of bounds
+    const range = if (range_index < ranges.len) ranges[range_index] else 5000.0;
+
+    // Convert AD value to initial strain value
+    var strain = (range / AD_MAX_VALUE) * @as(f32, @floatFromInt(ad_value));
+
+    // Apply compensations for 1G2W or 1G3W strain modes
+    if (strain_mode == 0 or strain_mode == 1) { // 1G2W or 1G3W
+        // First apply nonlinearity compensation
+        strain = compensateNonlinearity(strain);
+
+        // Then apply gage factor compensation
+        strain = compensateGageFactor(strain, gage_factor);
+    }
+
+    return strain;
+}
+
+// Updated AdDataSample struct to include gage factor
+const AdDataSample = struct {
     timestamp: i128,
     channel_data: [16]f32, // Converted engineering units
     raw_ad_data: [16]i32, // Original AD values
+    gage_factors: [16]f32, // Gage factors for each channel
 };
 
 pub const DataAcquisitionConfig = struct {
@@ -674,20 +722,20 @@ pub const DataAcquisitionStats = struct {
     last_error: ?anyerror = null,
 };
 
-fn convertAdValueToRange(ad_value: i32, range_index: u8) f32 {
-    const ranges = [_]f32{
-        200.0, // 200 μm/m
-        500.0, // 500 μm/m
-        1000.0, // 1000 μm/m
-        2000.0, // 2000 μm/m
-        5000.0, // 5000 μm/m
-        10000.0, // 10000 μm/m
-        20000.0, // 20000 μm/m
-    };
+// fn convertAdValueToRange(ad_value: i32, range_index: u8) f32 {
+//     const ranges = [_]f32{
+//         200.0, // 200 μm/m
+//         500.0, // 500 μm/m
+//         1000.0, // 1000 μm/m
+//         2000.0, // 2000 μm/m
+//         5000.0, // 5000 μm/m
+//         10000.0, // 10000 μm/m
+//         20000.0, // 20000 μm/m
+//     };
 
-    const selected_range = if (range_index < ranges.len) ranges[range_index] else 5000.0;
-    return (selected_range / 8200000.0) * @as(f32, @floatFromInt(ad_value));
-}
+//     const selected_range = if (range_index < ranges.len) ranges[range_index] else 5000.0;
+//     return (selected_range / 8200000.0) * @as(f32, @floatFromInt(ad_value));
+// }
 
 pub const ContinuousDataAcquisition = struct {
     config: DataAcquisitionConfig,
@@ -867,6 +915,33 @@ pub const ContinuousDataAcquisition = struct {
         return ad_data;
     }
 
+    fn processGmdData(self: *ContinuousDataAcquisition, raw_data: []const i32, timestamp: i128) !void {
+        var sample = AdDataSample{
+            .timestamp = timestamp,
+            .channel_data = undefined,
+            .raw_ad_data = undefined,
+            .gage_factors = undefined,
+        };
+
+        // Initialize gage factors (could be loaded from configuration)
+        @memset(&sample.gage_factors, DEFAULT_GAGE_FACTOR);
+
+        // Process each channel
+        for (0..@min(raw_data.len, MAX_CHANNELS)) |i| {
+            sample.raw_ad_data[i] = raw_data[i];
+            sample.channel_data[i] = convertAdValueToRange(raw_data[i], self.measuring_conditions.channel_conditions[i].range_no, self.measuring_conditions.channel_conditions[i].strain_mode_no, sample.gage_factors[i]);
+        }
+
+        // Store the sample in the circular buffer
+        self.data_mutex.lock();
+        defer self.data_mutex.unlock();
+
+        if (!self.circular_buffer.push(sample)) {
+            self.stats.buffer_overruns += 1;
+        }
+        self.stats.total_samples += 1;
+    }
+
     fn acquisitionLoop(self: *ContinuousDataAcquisition) !void {
         // Status command
         var status_cmd = CommandHeader{};
@@ -911,26 +986,30 @@ pub const ContinuousDataAcquisition = struct {
             var count: usize = 0;
 
             while (std.time.timestamp() < end_time) {
-                var response_buffer: [1024 * 1024]u8 = undefined;
-                std.debug.print("\n=== GMD Command #{d} ===\n", .{count});
-                // _ = try pcd.usbSendCmd(std.mem.asBytes(&status_cmd));
-                // _ = try pcd.usbReceiveCmd(std.mem.asBytes(&status_response));
+                // var response_buffer: [1024 * 8]u8 = undefined;
+                // std.debug.print("\n=== GMD Command #{d} ===\n", .{count});
 
-                // std.debug.print("PCD Status: 0x{X:0>8}\n", .{status_response.pcd_status});
-                // std.debug.print("Error Status: 0x{X:0>8}\n", .{status_response.pcd_error_status});
+                // // Send GMD command
+                // try pcd.usbSendCmd(std.mem.asBytes(&cmd));
+                // std.debug.print("GMD command sent\n", .{});
 
-                // _ = try pcd.usbSendCmd(std.mem.asBytes(&status_cmd));
-                // _ = try pcd.usbReceiveCmd(std.mem.asBytes(&status_response));
+                // // Receive response
+                // const receive_size = try pcd.usbReceiveCmd(&response_buffer);
+                // std.debug.print("Received {d} bytes\n", .{receive_size});
 
-                // std.debug.print("PCD Status: 0x{X:0>8}\n", .{status_response.pcd_status});
-                // std.debug.print("Error Status: 0x{X:0>8}\n", .{status_response.pcd_error_status});
-                // Send GMD command
+                var response_buffer: [1024 * 8]u8 = undefined;
+
                 try pcd.usbSendCmd(std.mem.asBytes(&cmd));
-                std.debug.print("GMD command sent\n", .{});
-
-                // Receive response
                 const receive_size = try pcd.usbReceiveCmd(&response_buffer);
-                std.debug.print("Received {d} bytes\n", .{receive_size});
+
+                if (receive_size >= @sizeOf(ResponseHeader)) {
+                    const header = @as(*const ResponseHeader, @ptrCast(@alignCast(&response_buffer)));
+                    const data_start = @sizeOf(ResponseHeader);
+                    const data_slice = response_buffer[data_start..@intCast(receive_size)];
+                    const ad_data = @as([*]const i32, @ptrCast(@alignCast(data_slice.ptr)))[0..header.number_of_channels];
+
+                    try self.processGmdData(ad_data, std.time.nanoTimestamp());
+                }
 
                 // Print response as hex for debugging
                 //printHexView("Response", response_buffer[0..@intCast(receive_size)]);
@@ -1293,24 +1372,24 @@ pub fn main() !void {
     );
     defer acquisition.deinit();
 
+    // Create CSV file for data recording
+    var csv_file = try std.fs.cwd().createFile("measurement_data.csv", .{});
+    defer csv_file.close();
+
+    // Write CSV header with strain units
+    try csv_file.writer().print("Timestamp", .{});
+    for (0..active_channels) |i| {
+        try csv_file.writer().print(",CH{}_Strain(μm/m)", .{i + 1});
+    }
+    try csv_file.writer().print("\n", .{});
+
     // Start data acquisition
     try acquisition.start();
     std.debug.print("Data acquisition started...\n", .{});
 
-    // Prepare CSV file for recording
-    var csv_file = try std.fs.cwd().createFile("measurement_data.csv", .{});
-    defer csv_file.close();
-
-    // Write CSV header
-    try csv_file.writer().print("Timestamp", .{});
-    for (0..active_channels) |i| {
-        try csv_file.writer().print(",Channel{}", .{i + 1});
-    }
-    try csv_file.writer().print("\n", .{});
-
     // Set measurement duration
     const start_time = std.time.timestamp();
-    const measurement_duration_s: i64 = 60; // 60 seconds measurement
+    const measurement_duration_s: i64 = 10; // 60 seconds measurement
 
     // Sample buffer
     var sample_buffer: [1000]AdDataSample = undefined;
@@ -1328,35 +1407,39 @@ pub fn main() !void {
                 // Write timestamp
                 try csv_file.writer().print("{}", .{sample.timestamp});
 
-                // Write channel data with conversion
+                // Write converted strain values for each channel
                 for (0..active_channels) |ch| {
-                    const range_value = convertAdValueToRange(sample.raw_ad_data[ch], config.channel_conditions[ch].range_no);
-                    try csv_file.writer().print(",{d:.3}", .{range_value});
+                    const strain_value = sample.channel_data[ch];
+                    try csv_file.writer().print(",{d:.3}", .{strain_value});
                 }
                 try csv_file.writer().print("\n", .{});
             }
+
+            // Print stats every 1000 samples
+            if (acquisition.getStats().total_samples % 1000 == 0) {
+                const stats = acquisition.getStats();
+                std.debug.print("\rSamples: {d}, Overruns: {d}, Errors: {d}", .{
+                    stats.total_samples,
+                    stats.buffer_overruns,
+                    stats.comm_errors,
+                });
+            }
         }
 
-        // Periodically print statistics
-        const stats = acquisition.getStats();
-        if (stats.buffer_overruns > 0 or stats.comm_errors > 0) {
-            std.debug.print("Statistics - Samples: {d}, Overruns: {d}, Errors: {d}\n", .{ stats.total_samples, stats.buffer_overruns, stats.comm_errors });
-        }
-
-        // Prevent tight loop
+        // Small delay to prevent tight loop
         std.time.sleep(10 * std.time.ns_per_ms);
     }
 
-    // Cleanup and final statistics
-    std.debug.print("Stopping data acquisition...\n", .{});
+    // Stop acquisition and print final statistics
+    std.debug.print("\nStopping data acquisition...\n", .{});
     acquisition.stop();
 
-    const stats = acquisition.getStats();
+    const final_stats = acquisition.getStats();
     std.debug.print("\nFinal Statistics:\n", .{});
-    std.debug.print("Total Samples: {d}\n", .{stats.total_samples});
-    std.debug.print("Buffer Overruns: {d}\n", .{stats.buffer_overruns});
-    std.debug.print("Communication Errors: {d}\n", .{stats.comm_errors});
-    if (stats.last_error) |err| {
+    std.debug.print("Total Samples: {d}\n", .{final_stats.total_samples});
+    std.debug.print("Buffer Overruns: {d}\n", .{final_stats.buffer_overruns});
+    std.debug.print("Communication Errors: {d}\n", .{final_stats.comm_errors});
+    if (final_stats.last_error) |err| {
         std.debug.print("Last Error: {}\n", .{err});
     }
 
