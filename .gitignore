@@ -22,3 +22,13 @@ zig-out/
 zig-cache/
 
 *.exe*
+
+# Binary output
+*.exe
+*.pdb
+*.obj
+*.o
+*.lib
+*.dll
+*.so
+*.dylib
